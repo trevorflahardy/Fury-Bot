@@ -257,6 +257,9 @@ class FuryBot(commands.Bot):
         # Mapping[guild_id, InfractionsSettings]
         self._infractions_settings: Dict[int, InfractionsSettings] = {}
 
+        # Mapping[guild_id, Mapping[invite_code, Invite]]
+        self._invites_cache: Dict[int, Dict[str, discord.Invite]] = {}
+
         super().__init__(
             command_prefix=commands.when_mentioned_or("trev.", "trev", 'fury', 'fury.'),
             help_command=None,
@@ -352,6 +355,32 @@ class FuryBot(commands.Bot):
             embed.set_author(name=author.name, icon_url=author.display_avatar.url)
 
         return embed
+
+    # Invite cache management
+    def get_invite(self, guild_id: int, invite_code: str, /) -> Optional[discord.Invite]:
+        return self._invites_cache.get(guild_id, {}).get(invite_code)
+
+    def get_invites(self, guild_id: int, /) -> Dict[str, discord.Invite]:
+        return self._invites_cache.get(guild_id, {})
+
+    def get_all_invites(self, /) -> List[discord.Invite]:
+        invites: List[discord.Invite] = []
+        for guild_id in self._invites_cache:
+            invites.extend(self._invites_cache[guild_id].values())
+
+        return invites
+
+    def add_invite(self, guild_id: int, invite: discord.Invite, /, *, label: Optional[str] = None) -> None:
+        self._invites_cache.setdefault(guild_id, {})[label or invite.code] = invite
+
+    def set_invites(self, guild_id: int, invite_mapping: Dict[str, discord.Invite], /) -> None:
+        self._invites_cache[guild_id] = invite_mapping
+
+    def remove_invite(self, guild_id: int, invite_code: str, /) -> Optional[discord.Invite]:
+        return self._invites_cache.get(guild_id, {}).pop(invite_code, None)
+
+    def clear_invites(self, guild_id: int, /) -> None:
+        self._invites_cache.pop(guild_id, None)
 
     # Utilities for finding cache functions
     def get_cache_function(self, cache_flag_name: str) -> Optional[CacheFunc[[], Optional[Any]]]:
@@ -728,6 +757,69 @@ class FuryBot(commands.Bot):
     @wrap_extension
     async def unload_extension(self, name: str, /, *, package: Optional[str] = None) -> None:
         return await super().unload_extension(name, package=package)
+
+    async def __verify_invite_expiration_timers(
+        self, guild_id: int, invites: Dict[str, discord.Invite], connection: ConnectionType
+    ) -> None:
+        # Ensure that every invite that has an expiration time has a timer set
+        # waiting for it to expire. This ensures that, for some reason, if a invite is created
+        # while the bot is down we still have new timers for all them.
+
+        # Fetch all the invites from this guild (guild_id in extra JSONB field == guild_id)
+        existing_timers = await connection.fetch(
+            """
+            SELECT (extra->>'invite_code')::bigint AS invite_code FROM timers WHERE (extra->>'guild_id')::bigint = $1;
+            """,
+            guild_id,
+        )
+        existing_invite_codes = {entry['invite_code'] for entry in existing_timers}
+
+        for invite_code, invite in invites.items():
+            if invite_code in existing_invite_codes:
+                continue
+
+            if invite.expires_at and self.timer_manager:
+                # This invite has an expiration time, we need to set a timer for it
+                # to expire.
+                await self.timer_manager.create_timer(
+                    invite.expires_at,
+                    event='invite_expired',
+                    guild_id=guild_id,
+                    invite_code=invite_code,
+                )
+
+    async def __cache_invites_load_guild(self, guild: discord.Guild, connection: ConnectionType) -> None:
+        try:
+            invites = await guild.invites()
+        except discord.HTTPException:
+            return None
+
+        fetched = {invite.code: invite for invite in invites}
+        self.set_invites(guild.id, fetched or {})
+
+        if 'VANITY_URL' in guild.features:
+            try:
+                vanity = await guild.vanity_invite()
+            except discord.HTTPException:
+                # This vanity url, for some reason, failed to be fetched.
+                # We'll just ignore it.
+                pass
+            else:
+                if vanity:
+                    self.add_invite(guild.id, vanity, label='VANITY')
+
+        all_invites = self.get_invites(guild.id)
+        await self.__verify_invite_expiration_timers(guild.id, all_invites, connection)
+
+    @cache_loader('INVITES')
+    async def _cache_invites(self, connection: ConnectionType) -> None:
+        await self.wait_until_ready()
+
+        tasks: List[asyncio.Task[None]] = []
+        for guild in self.guilds:
+            tasks.append(self.create_task(self.__cache_invites_load_guild(guild, connection)))
+
+        await asyncio.gather(*tasks)
 
     @cache_loader('INFRACTIONS_SETTINGS')
     async def _cache_infractions_settings(self, connection: ConnectionType) -> None:

@@ -20,13 +20,16 @@ import importlib.util
 import logging
 import re
 from types import ModuleType
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Coroutine, Dict, List, Optional, Sequence, TypeVar
 
-import asyncpg
 import discord
 from discord.ext import commands
+from typing_extensions import ParamSpec
 
 from utils import RUNNING_DEVELOPMENT, BaseCog, Context, human_join
+
+P = ParamSpec('P')
+T = TypeVar('T')
 
 if TYPE_CHECKING:
     from bot import FuryBot
@@ -171,6 +174,20 @@ class Owner(BaseCog):
 
         return await ctx.send(embed=embed)
 
+    @staticmethod
+    async def __sql__operation(
+        ctx: Context, func: Callable[P, Coroutine[Any, Any, T]], *args: P.args, **kwargs: P.kwargs
+    ) -> Optional[T]:
+        """
+        Does a SQL operation and returns the result. Will let the user know of errors, if any, and return
+        ``None`` if an error occurred.
+        """
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:
+            await ctx.send(to_code_block(str(exc), language='sql'))
+            return None
+
     @commands.group(invoke_without_command=True, name='sql', description='Run SQL queries.')
     @commands.is_owner()
     async def sql(self, ctx: Context, *, sql: Annotated[str, CodeBlockStripper]) -> Optional[discord.Message]:
@@ -184,17 +201,10 @@ class Owner(BaseCog):
         async with ctx.typing(), self.bot.safe_connection() as connection:
             _log.debug('Executing SQL query: %s', sql)
 
-            try:
-                status = await connection.fetchrow(sql)
-            except asyncpg.exceptions.PostgresSyntaxError as exc:
-                return await ctx.send(to_code_block(str(exc), language='sql'))
-            except Exception as exc:
-                # If we encounter an error, the invoker has messed up. Send this to the
-                # error handler to log the error and notify the user.
-                return await self.bot.error_handler.log_error(exc, target=ctx, event_name='sql-fetchrow-fail')
-
+            status = await self.__sql__operation(ctx, connection.fetchrow, sql)
             if not status:
-                return await ctx.message.add_reaction('❌')
+                await ctx.message.add_reaction('❌')
+                return await ctx.send('No results found.')
 
             markdown = to_markdown_table([dict(status)], padding=2)
             code_block = to_code_block(markdown, language='sql')
@@ -210,16 +220,10 @@ class Owner(BaseCog):
         async with ctx.typing(), self.bot.safe_connection() as connection:
             _log.debug('Executing SQL query: %s', sql)
 
-            try:
-                status = await connection.fetch(sql)
-            except asyncpg.exceptions.PostgresSyntaxError as exc:
-                return await ctx.send(to_code_block(str(exc), language='sql'))
-            except Exception as exc:
-                # If we encounter an error, the invoker has messed up. Send this to the
-                # error handler to log the error and notify the user.
-                return await self.bot.error_handler.log_error(exc, target=ctx, event_name='sql-fetchrow-fail')
+            status = await self.__sql__operation(ctx, connection.fetch, sql)
             if not status:
-                return await ctx.message.add_reaction('❌')
+                await ctx.message.add_reaction('❌')
+                return await ctx.send('No results found.')
 
             markdown = to_markdown_table(list(map(dict, status)), padding=2)
             code_block = to_code_block(markdown, language='sql')
@@ -234,14 +238,8 @@ class Owner(BaseCog):
     async def execute(self, ctx: Context, *, sql: Annotated[str, CodeBlockStripper]) -> Optional[discord.Message]:
         async with ctx.typing(), self.bot.safe_connection() as connection:
             _log.debug('Executing SQL query: %s', sql)
-            try:
-                status = await connection.execute(sql)
-            except asyncpg.exceptions.PostgresSyntaxError as exc:
-                return await ctx.send(to_code_block(str(exc), language='sql'))
-            except Exception as exc:
-                # If we encounter an error, the invoker has messed up. Send this to the
-                # error handler to log the error and notify the user.
-                return await self.bot.error_handler.log_error(exc, target=ctx, event_name='sql-fetchrow-fail')
+
+            status = await self.__sql__operation(ctx, connection.execute, sql)
             return await ctx.send(to_code_block(str(status), language='sql'))
 
     @commands.group(name='cache', description='Reload a cache function through the bot.', invoke_without_command=True)

@@ -68,6 +68,10 @@ class BaseButtonPaginator(Generic[T], BaseView, abc.ABC):
         self._current_page_index = 0
         self.pages = [entries[i : i + per_page] for i in range(0, len(entries), per_page)]
 
+        if len(self.pages) == 1:
+            # Remove the buttons if there is only one page.
+            self.clear_items()
+
     @property
     def max_page(self) -> int:
         """:class:`int`: The max page count for this paginator."""
